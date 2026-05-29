@@ -265,7 +265,7 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 		echo "$(GOLANGCI_LINT) version is not expected $(GOLANGCI_LINT_VERSION). Removing it before installing."; \
 		rm -rf $(GOLANGCI_LINT); \
 	fi
-	test -s $(GOLANGCI_LINT) || GOBIN=$(LOCALBIN) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	test -s $(GOLANGCI_LINT) || GOBIN=$(LOCALBIN) go install -mod=mod github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen to $(LOCALBIN) if missing or wrong version.
@@ -274,7 +274,7 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 		echo "$(CONTROLLER_GEN) version is not expected $(CONTROLLER_GEN_VERSION). Removing it before installing."; \
 		rm -rf $(CONTROLLER_GEN); \
 	fi
-	test -s $(CONTROLLER_GEN) || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
+	test -s $(CONTROLLER_GEN) || GOBIN=$(LOCALBIN) go install -mod=mod sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize to $(LOCALBIN) if missing or wrong version.
