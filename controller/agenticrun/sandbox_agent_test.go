@@ -201,12 +201,6 @@ func TestSandboxAgentCaller_PreventsCreationAfterStop(t *testing.T) {
 		stop func(*agenticv1alpha1.AgenticRun)
 	}{
 		{
-			name: "cancelled spec",
-			stop: func(run *agenticv1alpha1.AgenticRun) {
-				run.Spec.Cancelled = true
-			},
-		},
-		{
 			name: "stopping condition",
 			stop: func(run *agenticv1alpha1.AgenticRun) {
 				run.Status.Conditions = []metav1.Condition{{
@@ -246,7 +240,7 @@ func TestSandboxAgentCaller_PreventsCreationAfterStop(t *testing.T) {
 	}
 }
 
-func TestSandboxAgentCaller_StopsSandboxIfCancellationPersistsDuringCreate(t *testing.T) {
+func TestSandboxAgentCaller_StopsSandboxIfStoppingPersistsDuringCreate(t *testing.T) {
 	ctx := context.Background()
 	run := testSandboxAgenticRun()
 	sandbox := &mockSandboxProvider{
@@ -259,9 +253,13 @@ func TestSandboxAgentCaller_StopsSandboxIfCancellationPersistsDuringCreate(t *te
 		if err := caller.K8sClient.Get(ctx, client.ObjectKeyFromObject(run), &current); err != nil {
 			t.Fatalf("get run during Create: %v", err)
 		}
-		current.Spec.Cancelled = true
-		if err := caller.K8sClient.Update(ctx, &current); err != nil {
-			t.Fatalf("persist cancellation during Create: %v", err)
+		current.Status.Conditions = append(current.Status.Conditions, metav1.Condition{
+			Type:   agenticv1alpha1.AgenticRunConditionStopping,
+			Status: metav1.ConditionTrue,
+			Reason: reasonSystemSuspended,
+		})
+		if err := caller.K8sClient.Status().Update(ctx, &current); err != nil {
+			t.Fatalf("persist stop during Create: %v", err)
 		}
 	}
 	caller = newTestSandboxAgentCallerWithAgenticRun(sandbox, run)
@@ -279,7 +277,7 @@ func TestSandboxAgentCaller_StopsSandboxIfCancellationPersistsDuringCreate(t *te
 		t.Fatalf("get run after Create: %v", err)
 	}
 	if current.Status.Steps.Analysis.Sandbox.ClaimName != "" {
-		t.Fatalf("sandbox reference was patched after cancellation: %+v", current.Status.Steps.Analysis.Sandbox)
+		t.Fatalf("sandbox reference was patched after stop: %+v", current.Status.Steps.Analysis.Sandbox)
 	}
 }
 
@@ -484,15 +482,19 @@ func TestPersistedRunRejectsUIDChange(t *testing.T) {
 	}
 }
 
-func TestSandboxAgentCallerUsesAPIReaderForCancellation(t *testing.T) {
+func TestSandboxAgentCallerUsesAPIReaderForStop(t *testing.T) {
 	ctx := context.Background()
 	run := testSandboxAgenticRun()
 	run.UID = "run-uid"
-	cancelled := run.DeepCopy()
-	cancelled.Spec.Cancelled = true
+	stopped := run.DeepCopy()
+	stopped.Status.Conditions = append(stopped.Status.Conditions, metav1.Condition{
+		Type:   agenticv1alpha1.AgenticRunConditionStopping,
+		Status: metav1.ConditionTrue,
+		Reason: reasonSystemSuspended,
+	})
 
 	staleCache := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(run).Build()
-	authoritative := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(cancelled).Build()
+	authoritative := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(stopped).Build()
 	provider := &mockSandboxProvider{claimName: "claim"}
 	caller := &SandboxAgentCaller{Sandbox: provider, K8sClient: staleCache, APIReader: authoritative, Namespace: "test-ns"}
 
@@ -501,6 +503,6 @@ func TestSandboxAgentCallerUsesAPIReaderForCancellation(t *testing.T) {
 		t.Fatalf("Analyze() error = %v, want %v", err, ErrRunStopAccepted)
 	}
 	if provider.claimCalls != 0 {
-		t.Fatalf("sandbox Create calls = %d, want 0 for a cancelled run", provider.claimCalls)
+		t.Fatalf("sandbox Create calls = %d, want 0 for a stopping run", provider.claimCalls)
 	}
 }

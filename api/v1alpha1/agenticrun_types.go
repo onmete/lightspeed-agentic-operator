@@ -255,7 +255,7 @@ const (
 	AgenticRunConditionEscalated        string = "Escalated"
 	AgenticRunConditionEmergencyStopped string = "EmergencyStopped"
 	// AgenticRunConditionStopping tracks in-progress sandbox teardown. It is
-	// shared by cancellation and global suspension and does not affect DerivePhase.
+	// used by the shared hard-stop contract and does not affect DerivePhase.
 	AgenticRunConditionStopping string = "Stopping"
 )
 
@@ -290,7 +290,6 @@ func (s AgenticRunStep) IsZero() bool {
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.analysis) || (has(self.analysis) && self.analysis == oldSelf.analysis)",message="analysis is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.execution) || (has(self.execution) && self.execution == oldSelf.execution)",message="execution is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.verification) || (has(self.verification) && self.verification == oldSelf.verification)",message="verification is immutable once set"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancelled) || !oldSelf.cancelled || (has(self.cancelled) && self.cancelled)",message="cancelled is one-way and cannot be cleared or removed"
 type AgenticRunSpec struct {
 	// request is the user's original request, alert description, or a
 	// description of what triggered this agentic run. This text is passed to
@@ -360,18 +359,11 @@ type AgenticRunSpec struct {
 	// re-analysis with the feedback appended to the original request.
 	//
 	// Mutable: this field can request re-analysis. The only other mutable
-	// spec fields are `cancelled` (one-way) and `terminalTTL` (until terminalTime).
+	// spec field is `terminalTTL` (until terminalTime).
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=32768
 	RevisionFeedback string `json:"revisionFeedback,omitempty"`
-	// cancelled is a one-way user signal requesting workflow termination. It
-	// defaults to false and, once true, cannot be cleared or removed. The
-	// controller reports teardown progress through the Stopping condition.
-	// +optional
-	// +default=false
-	Cancelled bool `json:"cancelled,omitempty"` //nolint:kubeapilinter // one-way cancellation is a binary signal with effective false default
-
 	// terminalTTL requests cleanup after this many whole days in a terminal
 	// phase (Completed, Failed, Denied, Escalated, EmergencyStopped).
 	// The operator caps this request at the cluster retention ceiling and

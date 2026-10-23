@@ -357,11 +357,7 @@ func (r *AgenticRunReconciler) handleStopping(
 		}
 	}
 	if reason == "" {
-		if run.Spec.Cancelled {
-			reason = reasonCancelledByUser
-		} else {
-			reason = reasonSystemSuspended
-		}
+		reason = reasonSystemSuspended
 	}
 
 	log.Info("stopping run", LogKeyPhase, phase, "reason", reason)
@@ -403,10 +399,6 @@ func (r *AgenticRunReconciler) handleStopping(
 	}
 	if suspended {
 		reason = reasonSystemSuspended
-	} else if condition := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionStopping); condition != nil && condition.Status == metav1.ConditionTrue && condition.Reason != "" {
-		reason = condition.Reason
-	} else if run.Spec.Cancelled {
-		reason = reasonCancelledByUser
 	}
 	stopping = meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionStopping)
 	if !isTerminal(phase) && (stopping == nil || stopping.Status != metav1.ConditionTrue || stopping.Reason != reason || stopping.Message != messageStopping) {
@@ -463,23 +455,13 @@ func (r *AgenticRunReconciler) handleStopping(
 		changed = true
 	}
 	if !isTerminal(phase) {
-		if reason == reasonSystemSuspended {
-			meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
-				Type:               agenticv1alpha1.AgenticRunConditionEmergencyStopped,
-				Status:             metav1.ConditionTrue,
-				Reason:             reasonSystemSuspended,
-				Message:            "Terminated by system kill switch (AgenticOLSConfig.spec.suspended=true)",
-				ObservedGeneration: run.Generation,
-			})
-		} else if conditionType := cancellationConditionType(phase); conditionType != "" {
-			meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
-				Type:               conditionType,
-				Status:             metav1.ConditionFalse,
-				Reason:             reasonCancelledByUser,
-				Message:            "Run stopped by user",
-				ObservedGeneration: run.Generation,
-			})
-		}
+		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+			Type:               agenticv1alpha1.AgenticRunConditionEmergencyStopped,
+			Status:             metav1.ConditionTrue,
+			Reason:             reasonSystemSuspended,
+			Message:            "Terminated by system kill switch (AgenticOLSConfig.spec.suspended=true)",
+			ObservedGeneration: run.Generation,
+		})
 		changed = true
 	}
 	if changed {

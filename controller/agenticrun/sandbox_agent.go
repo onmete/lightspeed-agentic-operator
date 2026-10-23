@@ -287,14 +287,21 @@ func (s *SandboxAgentCaller) ReleaseSandbox(ctx context.Context, run *agenticv1a
 
 func (s *SandboxAgentCaller) ReleaseSandboxes(ctx context.Context, run *agenticv1alpha1.AgenticRun) error {
 	log := logf.FromContext(ctx)
-	var firstErr error
+	var errs []error
 
 	// Resolve spoke access once for the entire teardown.
 	spoke, spokeErr := spokeAccessForRun(ctx, s.K8sClient, run, s.Namespace)
 	if spokeErr != nil {
 		log.Error(spokeErr, "release: spoke unreachable, skipping spoke cleanup")
+		// A missing kubeconfig is hard gone and must not block deletion; other
+		// spoke failures are typed so the deletion path can decide whether the
+		// bounded unverified-access window applies.
 		if !apierrors.IsNotFound(spokeErr) || run.DeletionTimestamp.IsZero() {
-			firstErr = spokeErr
+			errs = append(errs, &SpokeStopError{
+				Cluster: run.Spec.TargetCluster,
+				Kind:    classifySpokeAccessError(spokeErr),
+				Err:     spokeErr,
+			})
 		}
 	}
 
@@ -309,9 +316,7 @@ func (s *SandboxAgentCaller) ReleaseSandboxes(ctx context.Context, run *agenticv
 		}
 		if err := s.Sandbox.Release(ctx, run, step, spoke); err != nil {
 			log.Error(err, "failed to release sandbox", LogKeyClaim, claimName, LogKeyStep, step)
-			if firstErr == nil {
-				firstErr = err
-			}
+			errs = append(errs, err)
 		}
 	}
 
@@ -320,11 +325,11 @@ func (s *SandboxAgentCaller) ReleaseSandboxes(ctx context.Context, run *agenticv
 	// RBAC cleanup even without a claim name; missing spoke access skips it.
 	if !executionReleased {
 		// spoke already resolved above.
-		if err := cleanupStepRBAC(ctx, spoke, s.K8sClient, s.Namespace, run, "execution"); err != nil && firstErr == nil {
-			firstErr = err
+		if err := cleanupStepRBAC(ctx, spoke, s.K8sClient, s.Namespace, run, "execution"); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return firstErr
+	return errors.Join(errs...)
 }
 func (s *SandboxAgentCaller) StopSandboxes(ctx context.Context, run *agenticv1alpha1.AgenticRun) (bool, error) {
 	return s.Sandbox.StopSandboxes(ctx, run)

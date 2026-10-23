@@ -153,13 +153,14 @@ func main() {
 
 	// --- Register controllers ---
 	if err := (&agenticrun.AgenticRunReconciler{
-		Client:    mgr.GetClient(),
-		APIReader: mgr.GetAPIReader(),
-		Agent:     agentCaller,
-		Config:    cfgCache,
-		Namespace: namespace,
-		Audit:     auditLogger,
-		TempLog:   telemetryProvider,
+		Client:        mgr.GetClient(),
+		APIReader:     mgr.GetAPIReader(),
+		Agent:         agentCaller,
+		Config:        cfgCache,
+		Namespace:     namespace,
+		Audit:         auditLogger,
+		TempLog:       telemetryProvider,
+		EventRecorder: mgr.GetEventRecorderFor("agenticrun-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up AgenticRun controller")
 		os.Exit(1)
@@ -167,6 +168,8 @@ func main() {
 
 	if err := (&agenticolsconfig.Reconciler{
 		Client:        mgr.GetClient(),
+		APIReader:     apiReader,
+		Sandbox:       sandboxMgr,
 		EventRecorder: mgr.GetEventRecorderFor("agenticolsconfig-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up AgenticOLSConfig controller")

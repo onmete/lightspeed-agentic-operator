@@ -2,8 +2,10 @@ package agenticrun
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -103,6 +105,7 @@ type testAgentCaller struct {
 	stopSandboxesCalls     int
 	stopSandboxesConfirmed *bool
 	stopSandboxesErr       error
+	releaseSandboxesErr    error
 }
 
 func (ta *testAgentCaller) record(err error) bool {
@@ -195,7 +198,7 @@ func (ta *testAgentCaller) Escalate(ctx context.Context, run *agenticv1alpha1.Ag
 
 func (ta *testAgentCaller) ReleaseSandboxes(_ context.Context, _ *agenticv1alpha1.AgenticRun) error {
 	ta.releaseAllCount++
-	return nil
+	return ta.releaseSandboxesErr
 }
 func (ta *testAgentCaller) StopSandboxes(_ context.Context, _ *agenticv1alpha1.AgenticRun) (bool, error) {
 	ta.stopSandboxesCalls++
@@ -1000,6 +1003,82 @@ func TestDeletion_PreservedSandboxStillReleases(t *testing.T) {
 	}
 	if caller.releaseAllCount != 1 {
 		t.Fatalf("ReleaseSandboxes called %d times, want 1", caller.releaseAllCount)
+	}
+}
+
+func TestDeletion_GoneSpokeReleasesFinalizerAfterWindow(t *testing.T) {
+	deletedAt := metav1.NewTime(time.Now().Add(-SpokeRetryWindow - time.Second))
+	run := testAgenticRun()
+	run.UID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+	run.DeletionTimestamp = &deletedAt
+	run.Finalizers = []string{rbacCleanupFinalizer}
+
+	fc := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(run).
+		WithStatusSubresource(run).Build()
+	caller := newTestAgentCaller().withClient(t, fc, "default")
+	caller.releaseSandboxesErr = &SpokeStopError{Cluster: "spoke-a", Kind: SpokeStopGone, Err: errors.New("missing kubeconfig")}
+	r := &AgenticRunReconciler{Client: fc, Agent: caller, Namespace: "default"}
+
+	if _, err := reconcileOnce(r, "fix-crash"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var updated agenticv1alpha1.AgenticRun
+	err := fc.Get(context.Background(), types.NamespacedName{Name: "fix-crash", Namespace: "default"}, &updated)
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("get run: %v", err)
+	}
+	if err == nil && controllerutil.ContainsFinalizer(&updated, rbacCleanupFinalizer) {
+		t.Fatal("RBAC finalizer was not released after the retry window")
+	}
+}
+
+func TestDeletion_GoneSpokeKeepsFinalizerBeforeWindow(t *testing.T) {
+	deletedAt := metav1.NewTime(time.Now())
+	run := testAgenticRun()
+	run.UID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+	run.DeletionTimestamp = &deletedAt
+	run.Finalizers = []string{rbacCleanupFinalizer}
+
+	fc := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(run).
+		WithStatusSubresource(run).Build()
+	caller := newTestAgentCaller().withClient(t, fc, "default")
+	caller.releaseSandboxesErr = &SpokeStopError{Cluster: "spoke-a", Kind: SpokeStopGone, Err: errors.New("missing kubeconfig")}
+	r := &AgenticRunReconciler{Client: fc, Agent: caller, Namespace: "default"}
+
+	if _, err := reconcileOnce(r, "fix-crash"); err == nil {
+		t.Fatal("reconcile() error = nil, want retry before the window")
+	}
+	var updated agenticv1alpha1.AgenticRun
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: "fix-crash", Namespace: "default"}, &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(&updated, rbacCleanupFinalizer) {
+		t.Fatal("RBAC finalizer was released before the retry window")
+	}
+}
+
+func TestDeletion_HubErrorKeepsFinalizer(t *testing.T) {
+	deletedAt := metav1.NewTime(time.Now().Add(-SpokeRetryWindow - time.Second))
+	run := testAgenticRun()
+	run.UID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+	run.DeletionTimestamp = &deletedAt
+	run.Finalizers = []string{rbacCleanupFinalizer}
+
+	fc := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(run).
+		WithStatusSubresource(run).Build()
+	caller := newTestAgentCaller().withClient(t, fc, "default")
+	caller.releaseSandboxesErr = errors.New("forbidden")
+	r := &AgenticRunReconciler{Client: fc, Agent: caller, Namespace: "default"}
+
+	if _, err := reconcileOnce(r, "fix-crash"); err == nil {
+		t.Fatal("reconcile() error = nil, want hub cleanup error")
+	}
+	var updated agenticv1alpha1.AgenticRun
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: "fix-crash", Namespace: "default"}, &updated); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(&updated, rbacCleanupFinalizer) {
+		t.Fatal("RBAC finalizer was released on a non-spoke error")
 	}
 }
 

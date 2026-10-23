@@ -91,7 +91,7 @@ func pendingStopRefsFromRun(run *agenticv1alpha1.AgenticRun) (pods, sandboxes ma
 // different reconciler or a concurrent API update. Terminal runs are never
 // eligible to start another step.
 func runMustNotAdvance(run *agenticv1alpha1.AgenticRun) bool {
-	if run == nil || run.Spec.Cancelled {
+	if run == nil {
 		return true
 	}
 	stopping := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionStopping)
@@ -120,6 +120,8 @@ func (m *SandboxManager) StopSandboxes(ctx context.Context, run *agenticv1alpha1
 	latest := &agenticv1alpha1.AgenticRun{}
 	if err := reader.Get(ctx, client.ObjectKeyFromObject(run), latest); err == nil {
 		run = latest
+	} else if !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("get latest AgenticRun: %w", err)
 	}
 	inventory, stopErrs := m.discoverRunResources(ctx, reader, run, nil, nil, nil, nil)
 	// Record identities before deleting the owner chain (see
@@ -128,9 +130,13 @@ func (m *SandboxManager) StopSandboxes(ctx context.Context, run *agenticv1alpha1
 		stopErrs = append(stopErrs, err)
 	}
 
-	spoke, spokeErr := spokeAccessForRun(ctx, m.client, run, m.namespace)
+	spoke, spokeErr := spokeAccessForRun(ctx, reader, run, m.namespace)
 	if spokeErr != nil {
-		stopErrs = append(stopErrs, fmt.Errorf("resolve spoke access: %w", spokeErr))
+		stopErrs = append(stopErrs, &SpokeStopError{
+			Cluster: run.Spec.TargetCluster,
+			Kind:    classifySpokeAccessError(spokeErr),
+			Err:     fmt.Errorf("resolve spoke access: %w", spokeErr),
+		})
 		spoke = nil
 	}
 
@@ -142,7 +148,8 @@ func (m *SandboxManager) StopSandboxes(ctx context.Context, run *agenticv1alpha1
 	}
 	stopErrs = append(stopErrs, m.revokeSandboxAccess(ctx, reader, m.client, run, inventory.ownerUIDs, rbacNames, saNames, hubSANamespaces)...)
 	if spoke != nil {
-		stopErrs = append(stopErrs, m.revokeSandboxAccess(ctx, spoke.Client, spoke.Client, run, inventory.ownerUIDs, rbacNames, saNames, []string{spoke.Namespace})...)
+		spokeErrs := m.revokeSandboxAccess(ctx, spoke.Client, spoke.Client, run, inventory.ownerUIDs, rbacNames, saNames, []string{spoke.Namespace})
+		stopErrs = append(stopErrs, wrapSpokeOperationErrors(run.Spec.TargetCluster, spokeErrs)...)
 	}
 
 	// Stop replenishment before releasing claims. The current upstream pool
@@ -196,7 +203,7 @@ func (m *SandboxManager) StopSandboxes(ctx context.Context, run *agenticv1alpha1
 			pending = true
 		} else {
 			spokeAccessRemains, spokeAccessErrs := sandboxAccessRemains(ctx, spoke.Client, run, inventory.ownerUIDs, rbacNames, saNames, []string{spoke.Namespace})
-			stopErrs = append(stopErrs, spokeAccessErrs...)
+			stopErrs = append(stopErrs, wrapSpokeOperationErrors(run.Spec.TargetCluster, spokeAccessErrs)...)
 			pending = pending || spokeAccessRemains
 		}
 	}
@@ -235,6 +242,10 @@ func (m *SandboxManager) syncPendingStopRefs(ctx context.Context, run *agenticv1
 
 	current := &agenticv1alpha1.AgenticRun{}
 	if err := m.apiReader().Get(ctx, client.ObjectKeyFromObject(run), current); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The run is gone; orphan discovery still cleans labeled resources.
+			return nil
+		}
 		return fmt.Errorf("read AgenticRun for pending stop refs: %w", err)
 	}
 	if current.Annotations[stopPendingRefsAnnotation] == desired {
@@ -317,7 +328,7 @@ func (i *sandboxStopInventory) addOwnerUID(uid types.UID) {
 }
 
 func (i *sandboxStopInventory) addPod(pod *corev1.Pod) {
-	if pod == nil {
+	if pod == nil || !isActivePod(pod) {
 		return
 	}
 	key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
@@ -909,23 +920,11 @@ func uniqueStrings(values []string) []string {
 }
 
 func (m *SandboxManager) deleteRunArtifacts(ctx context.Context, reader client.Reader, run *agenticv1alpha1.AgenticRun) []error {
+	if run.Spec.TargetCluster == "" {
+		return nil
+	}
 	var errs []error
 	for _, step := range sandboxStopSteps {
-		configMap := &corev1.ConfigMap{}
-		key := types.NamespacedName{Namespace: m.namespace, Name: inputConfigMapName(step, string(run.UID))}
-		if err := reader.Get(ctx, key, configMap); err != nil {
-			if !apierrors.IsNotFound(err) {
-				errs = append(errs, fmt.Errorf("get input ConfigMap %s/%s: %w", key.Namespace, key.Name, err))
-			}
-		} else if !stopObjectMatchesRun(configMap, string(run.UID), map[types.UID]struct{}{run.UID: {}}, nil) {
-			errs = append(errs, fmt.Errorf("input ConfigMap %s/%s is not owned by run UID %s", key.Namespace, key.Name, run.UID))
-		} else if err := m.client.Delete(ctx, configMap, stopDeleteOptions(configMap)...); err != nil && !apierrors.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("delete input ConfigMap %s/%s: %w", key.Namespace, key.Name, err))
-		}
-
-		if run.Spec.TargetCluster == "" {
-			continue
-		}
 		secret := &corev1.Secret{}
 		secretKey := types.NamespacedName{Namespace: m.namespace, Name: sandboxKubeconfigSecretName(string(run.UID), step)}
 		if err := reader.Get(ctx, secretKey, secret); err != nil {
@@ -942,22 +941,12 @@ func (m *SandboxManager) deleteRunArtifacts(ctx context.Context, reader client.R
 }
 
 func (m *SandboxManager) runArtifactsRemain(ctx context.Context, reader client.Reader, run *agenticv1alpha1.AgenticRun) (bool, []error) {
+	if run.Spec.TargetCluster == "" {
+		return false, nil
+	}
 	var errs []error
 	remains := false
 	for _, step := range sandboxStopSteps {
-		key := types.NamespacedName{Namespace: m.namespace, Name: inputConfigMapName(step, string(run.UID))}
-		var configMap corev1.ConfigMap
-		if err := reader.Get(ctx, key, &configMap); err != nil {
-			if !apierrors.IsNotFound(err) {
-				errs = append(errs, fmt.Errorf("confirm input ConfigMap %s/%s: %w", key.Namespace, key.Name, err))
-			}
-		} else {
-			remains = true
-		}
-
-		if run.Spec.TargetCluster == "" {
-			continue
-		}
 		secretKey := types.NamespacedName{Namespace: m.namespace, Name: sandboxKubeconfigSecretName(string(run.UID), step)}
 		var secret corev1.Secret
 		if err := reader.Get(ctx, secretKey, &secret); err != nil {

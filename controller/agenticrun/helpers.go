@@ -102,7 +102,6 @@ const (
 	reasonRevising          = "Revising"
 	reasonRevisionComplete  = "RevisionComplete"
 	reasonSystemSuspended   = "SystemSuspended"
-	reasonCancelledByUser   = "CancelledByUser"
 	reasonTeardownComplete  = "TeardownComplete"
 	messageStopping         = "Stopping run; sandbox teardown in progress"
 	messageTeardownComplete = "Sandbox workloads and access removed"
@@ -303,7 +302,7 @@ func hasSandboxClaims(run *agenticv1alpha1.AgenticRun) bool {
 
 func terminalReason(run *agenticv1alpha1.AgenticRun) string {
 	for _, c := range run.Status.Conditions {
-		if c.Status == metav1.ConditionFalse && (c.Reason == reasonFailed || c.Reason == reasonCancelledByUser) {
+		if c.Status == metav1.ConditionFalse && c.Reason == reasonFailed {
 			return c.Message
 		}
 		if c.Status == metav1.ConditionTrue && (c.Reason == reasonUserDenied || c.Reason == reasonSystemSuspended || c.Reason == reasonNoActionRequired) {
@@ -343,37 +342,8 @@ func isStopCleanupComplete(run *agenticv1alpha1.AgenticRun) bool {
 }
 
 func isStoppedOutcome(run *agenticv1alpha1.AgenticRun) bool {
-	if condition := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionEmergencyStopped); condition != nil && condition.Status == metav1.ConditionTrue {
-		return true
-	}
-	for i := range run.Status.Conditions {
-		condition := &run.Status.Conditions[i]
-		switch condition.Type {
-		case agenticv1alpha1.AgenticRunConditionAnalyzed,
-			agenticv1alpha1.AgenticRunConditionExecuted,
-			agenticv1alpha1.AgenticRunConditionVerified,
-			agenticv1alpha1.AgenticRunConditionEscalated:
-			if condition.Status == metav1.ConditionFalse && condition.Reason == reasonCancelledByUser {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func cancellationConditionType(phase agenticv1alpha1.AgenticRunPhase) string {
-	switch phase {
-	case agenticv1alpha1.AgenticRunPhasePending, agenticv1alpha1.AgenticRunPhaseAnalyzing:
-		return agenticv1alpha1.AgenticRunConditionAnalyzed
-	case agenticv1alpha1.AgenticRunPhaseProposed, agenticv1alpha1.AgenticRunPhaseExecuting:
-		return agenticv1alpha1.AgenticRunConditionExecuted
-	case agenticv1alpha1.AgenticRunPhaseVerifying:
-		return agenticv1alpha1.AgenticRunConditionVerified
-	case agenticv1alpha1.AgenticRunPhaseEscalating:
-		return agenticv1alpha1.AgenticRunConditionEscalated
-	default:
-		return ""
-	}
+	condition := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionEmergencyStopped)
+	return condition != nil && condition.Status == metav1.ConditionTrue
 }
 
 func clearSandboxReferences(run *agenticv1alpha1.AgenticRun) bool {
@@ -411,7 +381,7 @@ func (r *AgenticRunReconciler) refreshRunForAsyncUpdate(ctx context.Context, run
 	}
 	*run = current
 
-	if !current.DeletionTimestamp.IsZero() || current.Spec.Cancelled || isStopping(&current) ||
+	if !current.DeletionTimestamp.IsZero() || isStopping(&current) ||
 		isStoppedOutcome(&current) || isStopCleanupComplete(&current) || isTerminal(agenticv1alpha1.DerivePhase(current.Status.Conditions)) {
 		return false, nil
 	}

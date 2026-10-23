@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -11,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	toolscache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -26,15 +28,16 @@ import (
 )
 
 const (
-	ErrRemoveFinalizer             = "remove finalizer"
-	ErrAddFinalizer                = "add finalizer"
-	ErrPatchTemplogCleanupAttempts = "patch templog cleanup attempts"
-	ErrPatchRBACCleanupAttempts    = "patch rbac cleanup attempts"
-	ErrStampTerminalTTL            = "stamp terminal TTL"
-	ErrConfigNotReady              = "operator configuration not yet available"
-	ErrDeleteExpiredRun            = "delete expired run"
-	ErrLabelTerminalRun            = "label terminal run"
-	terminalTTLLabel               = "agentic.openshift.io/ttl-managed"
+	ErrRemoveFinalizer              = "remove finalizer"
+	ErrAddFinalizer                 = "add finalizer"
+	ErrPatchTemplogCleanupAttempts  = "patch templog cleanup attempts"
+	ErrPatchRBACCleanupAttempts     = "patch rbac cleanup attempts"
+	ErrStampTerminalTTL             = "stamp terminal TTL"
+	ErrConfigNotReady               = "operator configuration not yet available"
+	ErrDeleteExpiredRun             = "delete expired run"
+	ErrLabelTerminalRun             = "label terminal run"
+	terminalTTLLabel                = "agentic.openshift.io/ttl-managed"
+	eventReasonRBACFinalizerRelease = "RBACFinalizerReleasedWithUnverifiedSpoke"
 )
 
 // TempLogCleaner is the interface for deleting templog records on CR deletion.
@@ -49,12 +52,13 @@ type AgenticRunReconciler struct {
 	client.Client
 	// APIReader is an authoritative, uncached reader. When nil it falls back
 	// to Client.
-	APIReader client.Reader
-	Agent     AgentCaller
-	Config    *configuration.Cache
-	Namespace string
-	Audit     AuditLogger
-	TempLog   TempLogCleaner
+	APIReader     client.Reader
+	Agent         AgentCaller
+	Config        *configuration.Cache
+	Namespace     string
+	Audit         AuditLogger
+	TempLog       TempLogCleaner
+	EventRecorder record.EventRecorder
 }
 
 func (r *AgenticRunReconciler) apiReader() client.Reader {
@@ -84,6 +88,7 @@ func (r *AgenticRunReconciler) apiReader() client.Reader {
 // +kubebuilder:rbac:groups=agentic.openshift.io,resources=agenticolsconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *AgenticRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -103,7 +108,13 @@ func (r *AgenticRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		if controllerutil.ContainsFinalizer(&run, rbacCleanupFinalizer) {
 			if err := r.Agent.ReleaseSandboxes(ctx, &run); err != nil {
-				return ctrl.Result{}, fmt.Errorf("release sandboxes during deletion: %w", err)
+				if !IsSpokeStopDegradeable(err) || run.DeletionTimestamp == nil || time.Since(run.DeletionTimestamp.Time) < SpokeRetryWindow {
+					return ctrl.Result{}, fmt.Errorf("release sandboxes during deletion: %w", err)
+				}
+				if r.EventRecorder != nil {
+					r.EventRecorder.Eventf(&run, corev1.EventTypeWarning, eventReasonRBACFinalizerRelease,
+						"Released RBAC cleanup finalizer after %s; spoke cleanup is unverified: %v", SpokeRetryWindow, err)
+				}
 			}
 			original := run.DeepCopy()
 			controllerutil.RemoveFinalizer(&run, rbacCleanupFinalizer)
@@ -273,25 +284,14 @@ func (r *AgenticRunReconciler) stopGuard(ctx context.Context, run *agenticv1alph
 		return ctrl.Result{}, false, err
 	}
 	if isStopping(run) {
-		reason := ""
-		if condition := meta.FindStatusCondition(run.Status.Conditions, agenticv1alpha1.AgenticRunConditionStopping); condition != nil {
-			reason = condition.Reason
-		}
-		if suspended {
-			reason = reasonSystemSuspended
-		}
-		result, err := r.handleStopping(ctx, run, reason)
+		result, err := r.handleStopping(ctx, run, reasonSystemSuspended)
 		return result, true, err
 	}
 	if suspended && !isTerminal(phase) {
 		result, err := r.handleStopping(ctx, run, reasonSystemSuspended)
 		return result, true, err
 	}
-	if run.Spec.Cancelled && !isTerminal(phase) {
-		result, err := r.handleStopping(ctx, run, reasonCancelledByUser)
-		return result, true, err
-	}
-	if isTerminal(phase) && (run.Spec.Cancelled || isStoppedOutcome(run) || isStopCleanupComplete(run) || (suspended && needsTerminalRevision(run, phase))) {
+	if isTerminal(phase) && (isStoppedOutcome(run) || isStopCleanupComplete(run) || (suspended && needsTerminalRevision(run, phase))) {
 		result, err := r.handleStoppedTerminalCleanup(ctx, run, phase)
 		return result, true, err
 	}
